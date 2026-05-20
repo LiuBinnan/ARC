@@ -3,8 +3,34 @@ from typing import Optional, Tuple
 from utils.pos_embed import VisionRotaryEmbeddingFast
 import torch
 from torch import nn
+import torch.nn.functional as F
+from flash_attn.ops.triton.layer_norm import layer_norm_fn
 
 from timm.models.vision_transformer import PatchEmbed
+
+
+class FlashLayerNorm(nn.Module):
+    def __init__(self, normalized_shape: int, eps: float = 1e-5) -> None:
+        super().__init__()
+        self.normalized_shape = normalized_shape
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(normalized_shape))
+        self.bias = nn.Parameter(torch.zeros(normalized_shape))
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+        dropout_p: float = 0.0,
+    ) -> torch.Tensor:
+        return layer_norm_fn(
+            x,
+            self.weight,
+            self.bias,
+            residual=residual,
+            eps=self.eps,
+            dropout_p=dropout_p,
+        )
 
 class MultiHeadSelfAttention(nn.Module):
     def __init__(
@@ -48,25 +74,25 @@ class MultiHeadSelfAttention(nn.Module):
 
         qkv = self.qkv(x)
         qkv = qkv.view(batch_size, seq_len, 3, self.num_heads, self.head_dim)
+        qkv = self.rotary.apply_qkv(qkv)
         qkv = qkv.permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
 
-        q = self.rotary(q)
-        k = self.rotary(k)
-
-        attn_scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
-
+        attn_mask = None
         if key_padding_mask is not None:
-            mask = key_padding_mask[:, None, None, :].to(dtype=torch.bool)
-            attn_scores = attn_scores.masked_fill(
-                mask,
-                torch.finfo(attn_scores.dtype).min,
-            )
+            # VARC key_padding_mask uses True for masked-out tokens.
+            # PyTorch SDPA bool masks use True for tokens that participate.
+            attn_mask = (~key_padding_mask.bool())[:, None, None, :]
 
-        attn_weights = torch.softmax(attn_scores, dim=-1)
-        attn_weights = self.attn_dropout(attn_weights)
+        context = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=attn_mask,
+            dropout_p=(self.attn_dropout.p if self.training else 0.0),
+            scale=self.scale,
+        )
 
-        context = torch.matmul(attn_weights, v)
         context = context.transpose(1, 2).reshape(batch_size, seq_len, self.embed_dim)
         context = self.proj(context)
         context = self.proj_dropout(context)
@@ -92,13 +118,13 @@ class ARCTransformerEncoderLayer(nn.Module):
             no_rope=no_rope,
         )
         self.dropout1 = nn.Dropout(dropout)
-        self.norm1 = nn.LayerNorm(embed_dim)
+        self.norm1 = FlashLayerNorm(embed_dim)
         self.linear1 = nn.Linear(embed_dim, mlp_dim)
         self.activation = nn.GELU()
         self.dropout2 = nn.Dropout(dropout)
         self.linear2 = nn.Linear(mlp_dim, embed_dim)
         self.dropout3 = nn.Dropout(dropout)
-        self.norm2 = nn.LayerNorm(embed_dim)
+        self.norm2 = FlashLayerNorm(embed_dim)
 
     def forward(
         self,
@@ -107,16 +133,22 @@ class ARCTransformerEncoderLayer(nn.Module):
     ) -> torch.Tensor:
         residual = x
         x = self.self_attn(x, key_padding_mask=key_padding_mask)
-        x = residual + self.dropout1(x)
-        x = self.norm1(x)
+        x = self.norm1(
+            x,
+            residual=residual,
+            dropout_p=(self.dropout1.p if self.training else 0.0),
+        )
 
         residual = x
         x = self.linear1(x)
         x = self.activation(x)
         x = self.dropout2(x)
         x = self.linear2(x)
-        x = residual + self.dropout3(x)
-        x = self.norm2(x)
+        x = self.norm2(
+            x,
+            residual=residual,
+            dropout_p=(self.dropout3.p if self.training else 0.0),
+        )
         return x
 
 
@@ -214,7 +246,7 @@ class ARCViT(nn.Module):
             )
 
         self.dropout = nn.Dropout(dropout)
-        self.norm = nn.LayerNorm(embed_dim)
+        self.norm = FlashLayerNorm(embed_dim)
         self.head = nn.Linear(embed_dim, num_colors * (1 if patch_size is None else patch_size)**2)
         self._reset_parameters()
 

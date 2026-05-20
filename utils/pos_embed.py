@@ -14,6 +14,7 @@ import torch
 from torch import nn
 
 from einops import rearrange, repeat
+from flash_attn.layers.rotary import apply_rotary_emb_func, apply_rotary_emb_qkv_
 
 
 
@@ -130,14 +131,46 @@ class VisionRotaryEmbeddingFast(nn.Module):
 
         self.register_buffer("freqs_cos", freqs_cos)
         self.register_buffer("freqs_sin", freqs_sin)
+        self.register_buffer("freqs_cos_half", freqs_cos[:, ::2].contiguous())
+        self.register_buffer("freqs_sin_half", freqs_sin[:, ::2].contiguous())
 
         self.no_rope = no_rope
 
         # print('======== shape of rope freq', self.freqs_cos.shape, '========')
 
     def forward(self, t):
-        
+        if torch.compiler.is_compiling():
+            return self.forward_torch(t)
+        rotary = t[:, :, self.no_rope:].transpose(1, 2)
+        rotary = apply_rotary_emb_func(
+            rotary,
+            self.freqs_cos_half,
+            self.freqs_sin_half,
+            interleaved=True,
+        ).transpose(1, 2)
+        if self.no_rope == 0:
+            return rotary
+        return torch.cat((t[:, :, :self.no_rope], rotary), dim=2)
+
+    def forward_torch(self, t):
         ret = t[:, :, self.no_rope:] * self.freqs_cos + rotate_half(t[:, :, self.no_rope:]) * self.freqs_sin
         if self.no_rope == 0:
             return ret
         return torch.cat((t[:, :, :self.no_rope], ret), dim=2)
+
+    def apply_qkv(self, qkv):
+        if torch.compiler.is_compiling():
+            q = self.forward_torch(qkv[:, :, 0].transpose(1, 2)).transpose(1, 2)
+            k = self.forward_torch(qkv[:, :, 1].transpose(1, 2)).transpose(1, 2)
+            return torch.stack((q, k, qkv[:, :, 2]), dim=2)
+        rotary = qkv if self.no_rope == 0 else qkv[:, self.no_rope:]
+        rotary = rotary.contiguous()
+        rotary = apply_rotary_emb_qkv_(
+            rotary,
+            self.freqs_cos_half,
+            self.freqs_sin_half,
+            interleaved=True,
+        )
+        if self.no_rope == 0:
+            return rotary
+        return torch.cat((qkv[:, :self.no_rope], rotary), dim=1)
