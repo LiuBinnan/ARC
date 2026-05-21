@@ -1,7 +1,7 @@
-torchrun --nproc_per_node=8 offline_train_ARC.py \
+python offline_train_ARC.py \
   --epochs 100 \
   --depth 10 \
-  --batch-size 32 \
+  --batch-size 384 \
   --image-size 64 \
   --patch-size 2 \
   --learning-rate 3e-4 \
@@ -19,5 +19,5 @@ torchrun --nproc_per_node=8 offline_train_ARC.py \
   --lr-scheduler "cosine" \
   --architecture "vit" \
   --vis-every 50 \
-  --distributed \
   --use-wandb \
+  --no-compile

@@ -5,6 +5,8 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 from flash_attn.ops.triton.layer_norm import layer_norm_fn
+from flash_attn import flash_attn_varlen_func
+from flash_attn.bert_padding import unpad_input
 
 from timm.models.vision_transformer import PatchEmbed
 
@@ -57,6 +59,8 @@ class MultiHeadSelfAttention(nn.Module):
         self.proj = nn.Linear(embed_dim, embed_dim)
         self.attn_dropout = nn.Dropout(dropout)
         self.proj_dropout = nn.Dropout(dropout)
+        self._cu_seqlens_q_cache_key = None
+        self._cu_seqlens_q_cache = None
 
         half_head_dim = embed_dim // num_heads // 2
         self.rotary = VisionRotaryEmbeddingFast(
@@ -64,6 +68,24 @@ class MultiHeadSelfAttention(nn.Module):
             pt_seq_len=int(max_seq_len ** 0.5),
             no_rope=no_rope,
         )
+
+    def _get_cu_seqlens_q(
+        self,
+        batch_size: int,
+        seq_len: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        cache_key = (device.type, device.index, batch_size, seq_len)
+        if self._cu_seqlens_q_cache_key != cache_key:
+            self._cu_seqlens_q_cache_key = cache_key
+            self._cu_seqlens_q_cache = torch.arange(
+                0,
+                (batch_size + 1) * seq_len,
+                step=seq_len,
+                device=device,
+                dtype=torch.int32,
+            )
+        return self._cu_seqlens_q_cache
 
     def forward(
         self,
@@ -73,27 +95,44 @@ class MultiHeadSelfAttention(nn.Module):
         batch_size, seq_len, _ = x.shape
 
         qkv = self.qkv(x)
+        if qkv.dtype not in (torch.float16, torch.bfloat16):
+            qkv = qkv.to(torch.bfloat16)
         qkv = qkv.view(batch_size, seq_len, 3, self.num_heads, self.head_dim)
         qkv = self.rotary.apply_qkv(qkv)
-        qkv = qkv.permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]
+        # qkv = qkv.permute(2, 0, 3, 1, 4)
+        # q, k, v = qkv[0], qkv[1], qkv[2]
 
-        attn_mask = None
-        if key_padding_mask is not None:
-            # VARC key_padding_mask uses True for masked-out tokens.
-            # PyTorch SDPA bool masks use True for tokens that participate.
-            attn_mask = (~key_padding_mask.bool())[:, None, None, :]
+        # attn_mask = None
+        # if key_padding_mask is not None:
+        #     # VARC key_padding_mask uses True for masked-out tokens.
+        #     # PyTorch SDPA bool masks use True for tokens that participate.
+        #     attn_mask = (~key_padding_mask.bool())[:, None, None, :]
 
-        context = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=attn_mask,
-            dropout_p=(self.attn_dropout.p if self.training else 0.0),
-            scale=self.scale,
-        )
+        # context = F.scaled_dot_product_attention(
+        #     q,
+        #     k,
+        #     v,
+        #     attn_mask=attn_mask,
+        #     dropout_p=(self.attn_dropout.p if self.training else 0.0),
+        #     scale=self.scale,
+        # )
 
-        context = context.transpose(1, 2).reshape(batch_size, seq_len, self.embed_dim)
+        # context = context.transpose(1, 2).reshape(batch_size, seq_len, self.embed_dim)
+
+        q, k, v = qkv.unbind(dim=2)
+        assert key_padding_mask is not None, "key_padding_mask is required for variable-length attention"
+
+        q_unpad = q.flatten(0, 1)
+        cu_seqlens_q = self._get_cu_seqlens_q(batch_size, seq_len, x.device)
+        max_seqlen_q = seq_len
+        k_unpad, indices, cu_seqlens_k, max_seqlen_k, _ = unpad_input(k, ~key_padding_mask)
+        v_unpad = v.flatten(0, 1).index_select(0, indices)
+
+        dropout_p = self.attn_dropout.p if self.training else 0.0
+        context = flash_attn_varlen_func(q_unpad, k_unpad, v_unpad, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, dropout_p, self.scale).reshape(batch_size, seq_len, self.num_heads, self.head_dim)
+
+        context = context.reshape(batch_size, seq_len, self.embed_dim).to(x.dtype)
+
         context = self.proj(context)
         context = self.proj_dropout(context)
         return context
